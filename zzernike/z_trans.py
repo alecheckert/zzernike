@@ -14,12 +14,47 @@ from time import time
 from . import utils 
 
 # Normalization factors for the first 10 Z transforms
-z_trans_norm_10 = (2 * np.array([0.0, 1.0, 1.0, 2.0, 1.0, 
-    2.0, 3.0, 3.0, 3.0, 3.0]) + 2) / np.pi
-z_trans_norm_6 = z_trans_norm_10[:6] 
+z_trans_norm_15 = (2 * np.array([0.0, 1.0, 1.0, 2.0, 1.0, 
+    2.0, 3.0, 3.0, 3.0, 3.0, 4.0, 4.0, 2.0, 4.0, 4.0]) + 2) / np.pi
+z_trans_norm_10 = z_trans_norm_15[:10]
+z_trans_norm_6 = z_trans_norm_15[:6] 
+
+def fwd_15(image, center_yx, scale=3.0, unit_disk_only=True,
+    center_int=False, subtract_bg=False):
+    if center_int and subtract_bg:
+        raise RuntimeError("z_trans.fwd_10: cannot have both center_int and subtract_bg")
+
+    # Define the coordinates
+    Y, X = np.indices(image.shape)
+    Y = Y.astype('float64') - center_yx[0]
+    X = X.astype('float64') - center_yx[1]
+
+    # Get the corresponding Zernike polynomials
+    Z, R = z_poly.Z_through_15(Y, X, scale=scale,
+        unit_disk_only=unit_disk_only, return_R=True)
+
+    # Center the image intensities on the mean, if desired
+    if center_int:
+        if unit_disk_only:
+            inside = R <= 1.0
+            I_mean = image[inside].mean()
+            _I = image - I_mean 
+        else:
+            _I = image - image.mean()
+    elif subtract_bg:
+        bg = utils.ring_mean(image)
+        _I = image - bg
+        _I[_I < 0] = 0
+    else:
+        _I = image 
+
+    # Perform the transform
+    result = (Z * _I).sum((1, 2)) * z_trans_norm_15
+
+    return result 
 
 def fwd_10(image, center_yx, scale=4.0, unit_disk_only=True,
-    center_int=False):
+    center_int=False, subtract_bg=False):
     """
     Forward Zernike transform for the first 10 coefficients.
 
@@ -39,6 +74,9 @@ def fwd_10(image, center_yx, scale=4.0, unit_disk_only=True,
             Zernike coefficients
 
     """
+    if center_int and subtract_bg:
+        raise RuntimeError("z_trans.fwd_10: cannot have both center_int and subtract_bg")
+
     # Define the coordinates
     Y, X = np.indices(image.shape)
     Y = Y.astype('float64') - center_yx[0]
@@ -56,14 +94,19 @@ def fwd_10(image, center_yx, scale=4.0, unit_disk_only=True,
             _I = image - I_mean 
         else:
             _I = image - image.mean()
+    elif subtract_bg:
+        bg = utils.ring_mean(image)
+        _I = image - bg
+        _I[_I < 0] = 0
     else:
         _I = image 
 
     # Perform the transform
-    result = np.empty(10, dtype = 'float64')
-    result[0] = (Z[0,:,:] * image).sum() * z_trans_norm_10[0]
-    result[1:] = (Z[1:,:,:] * _I).sum((1,2)) * z_trans_norm_10[1:]
+    # result = np.empty(10, dtype = 'float64')
+    # result[0] = (Z[0,:,:] * image).sum() * z_trans_norm_10[0]
+    # result[1:] = (Z[1:,:,:] * _I).sum((1,2)) * z_trans_norm_10[1:]
 
+    result = (Z * _I).sum((1, 2)) * z_trans_norm_10
     return result 
 
 def fwd_6(image, center_yx, scale=4.0, unit_disk_only=True,
@@ -177,6 +220,33 @@ def inv_10(coefs, center_yx, shape, scale=4.0, unit_disk_only=True):
         result += coefs[j] * Z[j, :, :]
 
     return result 
+
+def mean_r(image, center_yx, scale=4.0, unit_disk_only=True):
+    """
+    Compute the mean radial distance of a photon from
+    a particular point.
+
+    args
+    ----
+        image :  2D ndarray
+        center_yx :  (float, float)
+        scale :  float, size of unit disk in pixels
+        unit_disk_only :  bool
+
+    returns
+    -------
+        float, the mean radial distance from center
+
+    """
+    Y, X = np.indices(image.shape)
+    Y = (Y.astype('float64') - center_yx[0]) / scale 
+    X = (X.astype('float64') - center_yx[1]) / scale 
+    R = np.sqrt(Y**2 + X**2)
+    if unit_disk_only:
+        inside = R <= 1.0
+        return (image[inside] * R[inside]).sum()
+    else:
+        return (image * R).sum()
 
 
 

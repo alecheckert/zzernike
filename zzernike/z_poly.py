@@ -180,9 +180,120 @@ def Z9(Y, X):
 # Zernike polynomials
 #
 
+def Z_through_15(Y, X, scale=1.0, unit_disk_only=False, return_R=False):
+    """
+    Calculate the first fifteen Zernike polynomials (through
+    all fourth-order).
+
+    args
+    ----
+        Y, X :  2D ndarrays, the y- and x- coordinates
+        scale :  float, rescaling of unit disk
+        unit_disk_only :  bool, set coordinates outside
+            the rescaled unit disk to 0
+        return_R :  bool, also return the radius from
+            the origin
+
+    returns
+    -------
+        (
+            3D ndarray of shape (10, size_y, size_x), the first ten
+                Zernike polynomials;
+
+            [if return_R] 2D ndarray of shape (size_y, size_x), the
+                radius from the origin
+        )
+
+    """
+    # Rescale field if necessary
+    if scale != 1.0:
+        Y_re = Y / scale 
+        X_re = X / scale
+    else:
+        Y_re = Y 
+        X_re = X 
+
+    # Cartesian fields
+    Y2 = Y_re ** 2
+    X2 = X_re ** 2
+    Y3 = Y_re ** 3
+    X3 = X_re ** 3
+    Y4 = Y_re ** 4
+    X4 = X_re ** 4
+
+    # Radial fields
+    R2 = Y2 + X2 
+    R = np.sqrt(R2)
+    R4 = R2**2
+
+    # Reusable factors
+    X_R2 = X_re * R2 
+    Y_R2 = Y_re * R2 
+    YX = Y_re * X_re 
+
+    # Out array
+    result = np.empty((15, Y.shape[0], Y.shape[1]), dtype = 'float64')
+
+    # Z[0,0]
+    result[0,:,:] = 1.0
+
+    # Z[-1,1]
+    result[1,:,:] = 2 * Y_re
+
+    # Z[+1,1]
+    result[2,:,:] = 2 * X_re 
+
+    # Z[-2,2]
+    result[3,:,:] = 2 * sqrts[6] * Y_re * X_re 
+
+    # Z[0,2]
+    result[4,:,:] = sqrts[3] * (2 * R2 - 1)
+
+    # Z[+2,2]
+    result[5,:,:] = sqrts[6] * (2 * X2 - R2)
+
+    # Z[-3,3]
+    result[6,:,:] = sqrts[8] * (3 * Y_R2 - 4 * Y3)
+
+    # Z[-1,3]
+    result[7,:,:] = sqrts[8] * (3 * Y_R2 - 2 * Y_re)
+
+    # Z[+1,3]
+    result[8,:,:] = sqrts[8] * (3 * X_R2 - 2 * X_re)
+
+    # Z[+3,3]
+    result[9,:,:] = sqrts[8] * (4 * X3 - 3 * X_R2)
+
+    # Z[-4,4]
+    result[10,:,:] = sqrts[10] * 4 * YX * (X2 - Y2)
+
+    # Z[-2,4]
+    result[11,:,:] = sqrts[10] * 2 * (4 * R2 - 3.0) * YX 
+
+    # Z[0,4]
+    result[12,:,:] = sqrts[5] * (6 * R4 - 6 * R2 + 1.0)
+
+    # Z[+2,4]
+    result[13,:,:] = sqrts[10] * (4 * R2 - 3.0) * (X2 - Y2)
+
+    # Z[+4,4]
+    result[14,:,:] = sqrts[10] * (X4 + Y4 - 6 * (YX**2))
+
+    # Only take values inside the unit disk, if desired
+    if unit_disk_only:
+        outside = (R > 1.0).nonzero()
+        result[:, outside[0], outside[1]] = 0
+
+    if return_R:
+        return result, R 
+    else:
+        return result 
+
+
 def Z_through_10(Y, X, scale=1.0, unit_disk_only=False, return_R=False):
     """
-    Calculate the first ten Zernike polynomials.
+    Calculate the first ten Zernike polynomials (through
+    all third-order).
 
     args
     ----
@@ -272,7 +383,8 @@ def Z_through_10(Y, X, scale=1.0, unit_disk_only=False, return_R=False):
 
 def Z_through_6(Y, X, scale=1.0, unit_disk_only=False, return_R=False):
     """
-    Calculate the first six Zernike polynomials.
+    Calculate the first six Zernike polynomials (through
+    all second-order).
 
     args
     ----

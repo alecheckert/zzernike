@@ -5,6 +5,14 @@ Zernike transforms for PSFs
 '''
 # Numerics
 import numpy as np 
+from scipy.spatial import distance_matrix 
+
+# LS fitting, for calculating the affine
+# field between the channels
+from scipy.optimize import curve_fit 
+
+# Parallelization
+import dask 
 
 # File reader
 from nd2reader import ND2Reader 
@@ -12,6 +20,10 @@ from nd2reader import ND2Reader
 # I/O
 import sys
 import os
+
+# Plotting
+import matplotlib.pyplot as plt 
+import seaborn as sns 
 
 # Profiling
 from time import time
@@ -21,6 +33,9 @@ import pandas as pd
 
 # Progress bar
 from tqdm import tqdm 
+
+# Get a list of ND2 files
+from glob import glob 
 
 # Uniform kernel filter, for smoothing a PSF image
 from scipy.ndimage import uniform_filter 
@@ -33,6 +48,9 @@ import warnings
 # Package utilities
 from . import utils 
 
+# Package I/O
+from . import zio 
+
 # Zernike transforms
 from . import z_trans 
 
@@ -41,16 +59,22 @@ from . import visualize
 
 def localize_biplane(
     nd2_path,
+    channel_gains = [107.3153, 96.4723],
+    channel_bgs = [470.7030, 212.1311],
     detect_sigma = 1.0,
     detect_threshold = 20.0,
     detect_window_size = 9,
     fit_window_size = 15,
-    scale = 5.0,
+    scale = 2.75,
     unit_disk_only = True,
     center_int = False,
-    subtract_bg = True,
+    subtract_bg = False,
     start_frame = None,
     stop_frame = None,
+    frames_to_do = None,
+    progress_bar = True,
+    n_coefs = 15,
+    tol_radius = 8.0,
 ):
     '''
     Use the radial symmetry method to detect and localize
@@ -65,11 +89,15 @@ def localize_biplane(
         window_size : int
         start_frame, stop_frame : int
 
+        n_coefs :  int, 6 or 10 or 15
+
     returns
         (pandas.DataFrame, pandas.DataFrame), localizations
             in each channel
 
     '''
+    assert n_coefs in [6, 10, 15]
+
     # Make an image file reader
     reader = ND2Reader(nd2_path)
     n_frames = reader.metadata['total_images_per_channel']
@@ -87,27 +115,42 @@ def localize_biplane(
     Sgc2 = (gc ** 2).sum()
     half_w = fit_window_size // 2
 
-    if start_frame is None:
-        start_frame = 0
-    if stop_frame is None:
-        stop_frame = n_frames - 1
+    if (frames_to_do is None):
+        if start_frame is None:
+            start_frame = 0
+        if stop_frame is None:
+            stop_frame = n_frames - 1
+        frames_to_do = np.arange(start_frame, stop_frame + 1)
 
-    # Do the same for both channels
+    # Run localization on each channel sequentially 
     output_dfs = []
     for channel_idx in [0, 1]:
 
-        print('Localizing %s in channel %d:' % (nd2_path, channel_idx))
-
         # Initialize output array
-        locs = np.zeros((1000000, 13), dtype = 'float64')
+        if n_coefs == 6:
+            locs = np.zeros((1000000, 14), dtype = 'float64')
+        elif n_coefs == 10:
+            locs = np.zeros((1000000, 18), dtype = 'float64')
+        elif n_coefs == 15:
+            locs = np.zeros((1000000, 23), dtype = 'float64')
 
         # Current localization index
         c_idx = 0
 
-        for frame_idx in tqdm(range(start_frame, stop_frame + 1)):
+        # Make the progress bar with tqdm 
+        if progress_bar:
+            t = tqdm(frames_to_do, leave = False)
+        else:
+            t = tqdm(frames_to_do, disable = True, leave = False)
+
+        for frame_idx in t:
 
             # Get the image corresponding to this frame
             image = reader.get_frame_2D(t = frame_idx, c = channel_idx).astype('float64')
+
+            # Convert from grayvalues to photons
+            image = (image - channel_bgs[channel_idx]) / channel_gains[channel_idx]
+            image[image < 0] = 0
 
             # Perform the convolutions required for the LL detection test
             A = uniform_filter(image, detect_window_size) * n_pixels
@@ -155,24 +198,79 @@ def localize_biplane(
                     locs[c_idx, 4:6] = np.array([y_rs, x_rs]) + locs[c_idx, 1:3] - half_w 
 
                     # Compute Zernike transform
-                    locs[c_idx, 7:13] = z_trans.fwd_6(
-                        psf_image,
-                        (y_rs, x_rs),
-                        scale = scale,
-                        unit_disk_only = unit_disk_only,
-                        center_int = center_int,
-                        subtract_bg = subtract_bg,
-                    ).copy()
+                    if n_coefs == 6:
+                        locs[c_idx, 7:13] = z_trans.fwd_6(
+                            psf_image,
+                            (y_rs, x_rs),
+                            scale = scale,
+                            unit_disk_only = unit_disk_only,
+                            center_int = center_int,
+                            subtract_bg = subtract_bg,
+                        ).copy()
 
+                        # Compute mean radial distance from center
+                        locs[c_idx, 13] = z_trans.mean_r(
+                            psf_image,
+                            (y_rs, x_rs),
+                            scale = scale,
+                            unit_disk_only = unit_disk_only,
+                        )
+                    elif n_coefs == 10:
+                        locs[c_idx, 7:17] = z_trans.fwd_10(
+                            psf_image,
+                            (y_rs, x_rs),
+                            scale = scale,
+                            unit_disk_only = unit_disk_only,
+                            center_int = center_int,
+                            subtract_bg = subtract_bg,
+                        ).copy()
+
+                        # Compute mean radial distance from center
+                        locs[c_idx, 17] = z_trans.mean_r(
+                            psf_image,
+                            (y_rs, x_rs),
+                            scale = scale,
+                            unit_disk_only = unit_disk_only,
+                        )
+                    elif n_coefs == 15:
+                        locs[c_idx, 7:22] = z_trans.fwd_15(
+                            psf_image,
+                            (y_rs, x_rs),
+                            scale = scale,
+                            unit_disk_only = unit_disk_only,
+                            center_int = center_int,
+                            subtract_bg = subtract_bg,
+                        ).copy()
+
+                        # Compute mean radial distance from center
+                        locs[c_idx, 22] = z_trans.mean_r(
+                            psf_image,
+                            (y_rs, x_rs),
+                            scale = scale,
+                            unit_disk_only = unit_disk_only,
+                        )
                 c_idx += 1
 
         locs = locs[:c_idx, :]
 
         # Format output and enforce some typing
-        locs = pd.DataFrame(locs, columns = [
-            'frame_idx', 'y_detect', 'x_detect', 'llr', 'y_pixels', 'x_pixels',
-            'error_code', 'Z0', 'Z1', 'Z2', 'Z3', 'Z4', 'Z5'
-        ])
+        if n_coefs == 6:
+            locs = pd.DataFrame(locs, columns = [
+                'frame_idx', 'y_detect', 'x_detect', 'llr', 'y_pixels', 'x_pixels',
+                'error_code', 'Z0', 'Z1', 'Z2', 'Z3', 'Z4', 'Z5', 'R0',
+            ])
+        elif n_coefs == 10:
+            locs = pd.DataFrame(locs, columns = [
+                'frame_idx', 'y_detect', 'x_detect', 'llr', 'y_pixels', 'x_pixels',
+                'error_code', 'Z0', 'Z1', 'Z2', 'Z3', 'Z4', 'Z5', 'Z6', 'Z7',
+                'Z8', 'Z9', 'R0',
+            ])  
+        elif n_coefs == 15:
+            locs = pd.DataFrame(locs, columns = [
+                'frame_idx', 'y_detect', 'x_detect', 'llr', 'y_pixels', 'x_pixels',
+                'error_code', 'Z0', 'Z1', 'Z2', 'Z3', 'Z4', 'Z5', 'Z6', 'Z7',
+                'Z8', 'Z9', 'Z10', 'Z11', 'Z12', 'Z13', 'Z14', 'R0',
+            ])  
         locs['frame_idx'] = locs['frame_idx'].astype('int64')
         locs['y_detect'] = locs['y_detect'].astype('int64')
         locs['x_detect'] = locs['x_detect'].astype('int64')
@@ -183,6 +281,219 @@ def localize_biplane(
     reader.close()
 
     return output_dfs
+
+def localize_biplane_parallel_directory(
+    nd2_directory,
+    out_directory,
+    dask_client,
+    verbose = False,
+    match = True,
+    **kwargs,
+):
+    nd2_files = glob("%s/*.nd2" % nd2_directory)
+    nd2_subpaths = [i.split('/')[-1] for i in nd2_files]
+    if not os.path.isdir(out_directory):
+        os.mkdir(out_directory)
+
+    for nd2_idx, nd2_file in enumerate(nd2_files):
+        loc_dfs = localize_biplane_parallel(
+            nd2_file,
+            dask_client,
+            verbose = verbose,
+            **kwargs,
+        )
+        out_file_0 = '%s/%s' % (
+            out_directory,
+            nd2_subpaths[nd2_idx].replace('.nd2', '_ch0_locs.txt')
+        )
+        out_file_1 = '%s/%s' % (
+            out_directory,
+            nd2_subpaths[nd2_idx].replace('.nd2', '_ch1_locs.txt')
+        )
+
+        loc_dfs[0].to_csv(out_file_0, sep = '\t', index = False)
+        loc_dfs[1].to_csv(out_file_1, sep = '\t', index = False)
+
+def localize_biplane_parallel(nd2_file, dask_client,
+    verbose=False, **kwargs):
+    """
+    Localize all particles in both planes of a ND2 file
+    using parallelization. Wrapper for localize_biplane().
+
+    args
+    ----
+        nd2_file :  str
+        dask_client :  dask.distributed.Client
+        verbose :  bool
+        **kwargs :  to localize_biplane()
+
+    returns
+    -------
+        (
+            pandas.DataFrame, localizations in channel 0;
+            pandas.DataFrame, localizations in channel 1
+        )
+
+    """
+    # Get the number of workers for this dask client
+    n_workers = len(dask_client.scheduler_info()['workers'])
+
+    kwargs['progress_bar'] = False
+    kwargs['start_frame'] = None
+    kwargs['stop_frame'] = None 
+
+    reader = zio.BiplaneImageFileReader(nd2_file)
+    N, M, n_frames = reader.get_shape()
+    reader.close()
+
+    # Divide the list of all frames into ranges that will be
+    # given to each individual worker
+    frames = np.arange(n_frames)
+    frame_ranges = [frames[i::n_workers] for i in range(n_workers)]
+
+    # Assign each frame range to a worker
+    results = []
+    for frame_range_idx, frame_range in enumerate(frame_ranges):
+        kwargs['frames_to_do'] = frame_range 
+        file_results = dask.delayed(localize_biplane)(nd2_file, **kwargs)
+        results.append(file_results)
+
+    t0 = time()
+    out_tuples = dask_client.compute(results)
+    out_tuples = [i.result() for i in out_tuples]
+    t1 = time()
+    if verbose:
+        print('Finished with %s\nRun time: %.2f sec' % (nd2_file, t1 - t0))
+
+    locs_0 = pd.concat(
+        [out_tuples[i][0] for i in range(len(out_tuples))],
+        ignore_index = True, sort = False,
+    )
+    locs_1 = pd.concat(
+        [out_tuples[i][1] for i in range(len(out_tuples))],
+        ignore_index = True, sort = False,
+    )
+    locs_0 = locs_0.sort_values(by = 'frame_idx')
+    locs_1 = locs_1.sort_values(by = 'frame_idx')
+    locs_0.index = np.arange(len(locs_0))
+    locs_1.index = np.arange(len(locs_1))
+
+    return locs_0, locs_1 
+
+def localize_match(nd2_file, dask_client=None, tol_radius=8.0,
+    cols = ['Z0', 'Z4', 'Z12'], verbose=False, lim=(-0.5, 1.5), **kwargs):
+    """
+    Localize spots in both channels of an ND2 file and also
+    match localizations between channels, returning the 
+    dataframe of all matched localizations.
+
+    args
+    ----
+        nd2_file :  str
+        dask_client :  dask.distributed.Client
+        tol_radius :  float, maximum distance between
+            matched localizations
+        cols :  list of str
+        lim :  (float, float), the boundaries on the data
+        **kwargs :  to localize_biplane()
+
+    returns
+    -------
+        pandas.DataFrame
+
+    """
+    # Localize spots in both channels
+    if not (dask_client is None):
+        locs_0, locs_1 = localize_biplane_parallel(nd2_file, dask_client,
+            verbose=verbose, **kwargs)
+    else:
+        locs_0, locs_1 = localize_biplane(nd2_file, **kwargs)
+
+    # Match localizations between channels 
+    locs = match_locs(locs_0, locs_1, tol_radius=tol_radius,
+        outlier_tol=tol_radius)
+
+    # Calculate f-ratios for the desired parameters
+    locs = f_ratio(locs, cols)
+    fcols = ['f%s' % c for c in cols]
+
+    # Remove crazy values
+    locs = bound_data(locs, fcols, lim)
+
+    return locs 
+
+
+def localize_z_polynomial(matched_locs, C, guess_z, z_coefs = ['Z0', 'Z4'], **kwargs):
+    """
+    Use a polynomial fit to Zernike coefficients to 
+    localize a particle in z. This is a wrapper for
+    distance_to_polynomial() that runs on all of the 
+    localizations in a dataframe.
+
+    args
+    ----
+        matched_locs :  pandas.DataFrame, matched localizations
+            between frames
+        C :  2D ndarray of shape (n_coefs, 6), the polynomial
+            coefficients corresponding to *z_coefs*
+        guess_z :  float, the initial guess for the z-positions
+        z_coefs :  list of int, the indices of the Zernike
+            polynomials to use
+        **kwargs :  to distance_to_polynomial()
+
+    returns
+    -------
+
+    """
+    # Work with a copy of the data
+    df = matched_locs.copy() 
+
+    n_locs = df.shape[0]
+    n_coefs = len(z_coefs)
+    cols_ch1 = ['%s_ch1' % i for i in z_coefs]
+    cols_f = ['f%s' % i for i in z_coefs]
+
+    # Compute the f-ratio for each coefficient
+    for i in range(n_coefs):
+        df[cols_f[i]] = df[z_coefs[i]] / \
+            (df[[z_coefs[i], cols_ch1[i]]].sum(axis=1))
+
+    # Get all of the point positions as an ndarray
+    positions = np.asarray(df[cols_f])
+
+    # Save the z-positions for each localization
+    z_pos = np.zeros(n_locs, dtype = 'float64')
+
+    # Fit each f-ratio to the model
+    for loc_idx in tqdm(range(n_locs)):
+        point = positions[loc_idx, :]
+        z_pos[loc_idx] = distance_to_polynomial(
+            point,
+            C,
+            guess_z,
+            **kwargs
+        )
+
+    # Add the result as a column to the dataframe
+    df['z_frames'] = z_pos 
+
+    # Return the modified dataframe
+    return df
+
+def localize_z_eig(
+    matched_locs,
+    cols = ['fZ0', 'fZ4', 'fZ12'],
+):
+    
+    cols_c = ['%s_c' % c for c in cols]
+
+    # Center the data
+    for c_idx, c in enumerate(cols):
+        matched_locs[cols_c[c_idx]] = matched_locs[c] - matched_locs[c].mean()
+
+    # Get the data as an ndarray
+    data = np.asarray(matched_locs[cols_c])
+
 
 def radial_symmetry(psf_image):
     '''
@@ -368,6 +679,8 @@ def match_locs(locs_0, locs_1, tol_radius=8.0, outlier_tol=8.0):
             in each channel 
         tol_radius :  float, max radius in pixels
             to call the same spot
+        outlier_tol :  float, max radius in pixels for 
+            second filter on spots
 
     returns
     -------
@@ -399,7 +712,7 @@ def match_locs(locs_0, locs_1, tol_radius=8.0, outlier_tol=8.0):
     c_idx = 0
 
     # Match localizations in each frame
-    for frame_idx in tqdm(range(n_frames)):
+    for frame_idx in range(n_frames):
 
         pos_0_in_frame = positions_0[positions_0[:,0] == frame_idx, :]
         pos_1_in_frame = positions_1[positions_1[:,0] == frame_idx, :]
@@ -432,6 +745,19 @@ def match_locs(locs_0, locs_1, tol_radius=8.0, outlier_tol=8.0):
     locs_0_matched['y_pixels_ch1'] = locs_1_matched['y_pixels']
     locs_0_matched['x_pixels_ch1'] = locs_1_matched['x_pixels']
 
+    # Add Zernike coefficients for ch1
+    if 'Z14' in locs_0_matched.columns:
+        n_coefs = 15
+    elif 'Z9' in locs_0_matched.columns:
+        n_coefs = 10
+    else:
+        n_coefs = 6
+    for coef_idx in range(n_coefs):
+        locs_0_matched['Z%d_ch1' % coef_idx] = locs_1_matched['Z%d' % coef_idx]
+
+    # Add mean radial distance coefficients for ch1
+    locs_0_matched['R0_ch1'] = locs_1_matched['R0']
+
     # Remove outliers
     y_shift_mean = locs_0_matched['y_shift'].mean()
     x_shift_mean = locs_0_matched['x_shift'].mean()
@@ -443,7 +769,64 @@ def match_locs(locs_0, locs_1, tol_radius=8.0, outlier_tol=8.0):
 
     return locs_0_matched 
 
-def calculate_affine_field(matched_locs):
+def f_ratio(matched_locs, col_name):
+    """
+    Convenience function to take the f-ratio of 
+    quantity X in channels 0 and 1, defined as 
+
+        f-ratio(X) = X(channel 0) / (X(channel 0) + X(channel 1))
+
+    args
+    ----
+        matched_locs :  pandas.DataFrame
+        col_name :  str or list of str
+
+    returns
+    -------
+        pandas.DataFrame with new column
+
+    """
+    if isinstance(col_name, list):
+        for c in col_name:
+            matched_locs = f_ratio(matched_locs, c)
+    else:
+        col_name_ch1 = '%s_ch1' % col_name 
+        assert col_name in matched_locs.columns 
+        assert col_name_ch1 in matched_locs.columns
+
+        matched_locs['f%s' % col_name] = matched_locs[col_name] / \
+            matched_locs[[col_name, col_name_ch1]].sum(axis = 1)
+
+    return matched_locs 
+
+def bound_data(dataframe, columns, bounds):
+    """
+    Apply simple bounds to each of a set of 
+    columns in a dataframe, returning only
+    elements that lie within the bounds.
+
+    args
+    ----
+        dataframe :  pandas.DataFrame
+        columns :  str or list of str
+        bounds :  (float, float)
+
+    returns
+    -------
+        pandas.DataFrame
+
+    """
+    result = dataframe.copy()
+    if isinstance(columns, str):
+        result = result[result[columns] <= bounds[1]]
+        result = result[result[columns] >= bounds[0]]
+    elif isinstance(columns, list):
+        for c in columns:
+            result = result[result[c] <= bounds[1]]
+            result = result[result[c] >= bounds[0]]
+    return result 
+
+def calculate_affine_field(matched_locs, plot=True):
     """
     Given a set of matched localizations, find an affine 
     field matrix that maps the localizations in channel 
@@ -473,68 +856,14 @@ def calculate_affine_field(matched_locs):
 
     popt_y, pcov = curve_fit(
         affine_model,
-        np.asarray(locs_0_matched[['y_pixels', 'x_pixels']]),
-        np.asarray(locs_0_matched['y_shift'])
+        np.asarray(matched_locs[['y_pixels', 'x_pixels']]),
+        np.asarray(matched_locs['y_shift'])
     )
     popt_x, pcov = curve_fit(
         affine_model,
-        np.asarray(locs_0_matched[['y_pixels', 'x_pixels']]),
-        np.asarray(locs_0_matched['x_shift'])
-    )   
-
-    # Compare the actual observed y-/x- shifts with the affine
-    # field model 
-    if plot:
-        locs_0_matched['y_shift_predicted'] = affine_model(
-            np.asarray(locs_0_matched[['y_pixels', 'x_pixels']]),
-            *popt_y,
-        )
-        fig, ax = plt.subplots(1, 2, figsize = (8, 4))
-        sns.scatterplot(
-            x = 'x_pixels',
-            y = 'y_pixels',
-            data = locs_0_matched,
-            hue = 'y_shift',
-            ax = ax[0],
-            hue_norm = (locs_0_matched['y_shift_predicted'].min(), locs_0_matched['y_shift_predicted'].max()),
-        )
-        sns.scatterplot(
-            x = 'x_pixels',
-            y = 'y_pixels',
-            data = locs_0_matched,
-            hue = 'y_shift_predicted',
-            ax = ax[1],
-            hue_norm = (locs_0_matched['y_shift_predicted'].min(), locs_0_matched['y_shift_predicted'].max()),
-        )
-        ax[0].set_title('y shift, observed')
-        ax[1].set_title('y shift, predicted')
-        plt.show(); plt.close()
-
-
-        locs_0_matched['x_shift_predicted'] = affine_model(
-            np.asarray(locs_0_matched[['y_pixels', 'x_pixels']]),
-            *popt_x,
-        )
-        fig, ax = plt.subplots(1, 2, figsize = (8, 4))
-        sns.scatterplot(
-            x = 'x_pixels',
-            y = 'y_pixels',
-            data = locs_0_matched,
-            hue = 'x_shift',
-            ax = ax[0],
-            hue_norm = (locs_0_matched['x_shift_predicted'].min(), locs_0_matched['x_shift_predicted'].max()),
-        )
-        sns.scatterplot(
-            x = 'x_pixels',
-            y = 'y_pixels',
-            data = locs_0_matched,
-            hue = 'x_shift_predicted',
-            ax = ax[1],
-            hue_norm = (locs_0_matched['x_shift_predicted'].min(), locs_0_matched['x_shift_predicted'].max()),
-        )
-        ax[0].set_title('x shift, observed')
-        ax[1].set_title('x shift, predicted')
-        plt.show(); plt.close()
+        np.asarray(matched_locs[['y_pixels', 'x_pixels']]),
+        np.asarray(matched_locs['x_shift'])
+    )  
 
     # Make the output matrix and vector
     affine_field_matrix = np.array([
@@ -543,9 +872,11 @@ def calculate_affine_field(matched_locs):
     ])
     offset = np.array([popt_y[2], popt_x[2]])
 
+    # Compare the actual observed y-/x- shifts with the affine
+    # field model 
+    if plot:
+        visualize.plot_affine_field(matched_locs, affine_field_matrix, offset)
+
     return affine_field_matrix, offset 
-
-
-
 
 

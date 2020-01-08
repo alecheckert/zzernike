@@ -77,3 +77,20 @@ class BiplaneImageFileReader():
         ax[0].imshow(image_ch0, cmap = 'gray', vmax = image_ch0.max() * vmax)
         ax[1].imshow(image_ch1, cmap = 'gray', vmax = image_ch1.max() * vmax)
         plt.show(); plt.close()
+
+    def min_max(self, start_frame, stop_frame, c = 0):
+        c_min, c_max = np.inf, 0 
+        N, M, n_frames = self.get_shape()
+        if n_frames - 1 < stop_frame:
+            stop_frame = n_frames - 1
+        for frame_idx in range(start_frame, stop_frame+1):
+            frame = self.get_frame(t=frame_idx, c=c)
+            frame_min = frame.min()
+            frame_max = frame.max()
+            if frame_min < c_min:
+                c_min = frame_min 
+            if frame_max > c_max:
+                c_max = frame_max 
+        return c_min, c_max 
+
+

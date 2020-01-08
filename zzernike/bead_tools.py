@@ -35,6 +35,227 @@ from . import z_trans
 # Visualization utilities
 from . import visualize 
 
+def find_and_align(
+    *nd2_files,
+    threshold = 5000,
+    max_distance = 8.0,
+    window_size = 15,
+    scale = 5.0,
+    unit_disk_only = True,
+    center_int = False,
+    subtract_bg = True,
+    plot_coefs = False,
+    align_kernel_size = 5,
+    align_window_size = 61,
+    return_window_size = 61,
+    plot_errors = False,
+    channel_gains = [107.3153, 96.4723],
+    channel_bgs = [470.7030, 212.1311],
+):
+    """
+    Given a set of ND2 files, find all beads, 
+    calculate Zernike coefficients, and align
+    the signals.
+
+    Robust combinations:
+        scale = 5.0, center_int = False
+        scale = 4.0, center_int = False
+        scale = 5.0, center_int = True
+        scale = 4.0, center_int = True 
+
+    args
+    ----
+        *nd2_files :   str
+        threshold :  float, detection stringency
+        max_distance :  float, maximum tolerated distance
+            between beads in channels 0 and 1
+        window_size :  int, the fitting window size
+        scale :  float, radius of the unit disk on which
+            to compute Zernike coefficients in um
+        unit_disk_only :  bool, only compute Zernike 
+            coefficients on the rescaled unit disk (recommended)
+        center_int :  bool, center the intensities before
+            computing coefficients 1 onward
+        plot_coefs :  bool
+        align_kernel_size :  int, size of kernel to be used for
+            smoothing signals before alignment
+        align_window_size :  int, size of the window used for
+            computing cross-correlation during alignment
+        return_window_size :  int, size of the return window
+            around the aligned signals
+        plot_errors :  bool
+
+    returns
+    -------
+        4D ndarray of shape (n_beads, 2, return_window_size, 6),
+            the first six Zernike coefficients for each bead,
+            channel, and z-plane
+
+    """
+    all_coefs = []
+
+    # Find beads and calculate Zernike coefficients
+    print("Finding beads and calculating Zernike coefficients...")
+    for nd2_idx, nd2_file in tqdm(enumerate(nd2_files)):
+        stack_ch0, stack_ch1, centers_ch0, centers_ch1, coefs = \
+            zernike_coefs_beads(
+                nd2_file,
+                threshold = threshold,
+                max_distance = max_distance,
+                window_size = window_size,
+                scale = scale,
+                unit_disk_only = unit_disk_only,
+                center_int = center_int,
+                subtract_bg = subtract_bg,
+                plot_coefs = plot_coefs,
+                smooth_kernel = None,
+                channel_gains = channel_gains,
+                channel_bgs = channel_bgs,
+            )
+        all_coefs.append(coefs)
+
+    # Align all of the signals
+    print("Aligning signals...")
+    n_signals = sum([all_coefs[i].shape[0] for i in range(len(all_coefs))])
+    keep = np.ones(n_signals, dtype = 'bool')
+
+    aligned_coefs = np.zeros((n_signals, 2, return_window_size, 16), dtype = 'float64')
+    c_idx = 0
+
+    ref_sig_ch0 = all_coefs[0][0,0,:,:]
+    ref_sig_ch1 = all_coefs[0][0,1,:,:]
+    hw = int(return_window_size) // 2
+
+    for nd2_idx in range(len(nd2_files)):
+        coefs = all_coefs[nd2_idx]
+        n_beads = coefs.shape[0]
+        for bead_idx in range(n_beads):
+
+            # Try to do alignment. If it fails, skip
+            # that bead.
+            try:
+                # Align channel 0
+                _ref_aligned, sig_aligned, n0, n1 = align_coefs(
+                    ref_sig_ch0,
+                    coefs[bead_idx, 0, :, :],
+                    kernel_size = align_kernel_size,
+                    align_window_size = align_window_size,
+                    return_size = return_window_size,
+                    plot = False,
+                )
+                aligned_coefs[c_idx, 0, :, :] = sig_aligned[:,:16].copy()
+
+                # Get the corresponding signal in channel 1
+                aligned_coefs[c_idx, 1, :, :] = coefs[
+                    bead_idx,
+                    1,
+                    n1-hw : n1+hw+1,
+                    :16,
+                ].copy()
+
+                # Align channel 1
+                # _ref_aligned, sig_aligned, n0, n1 = align_coefs(
+                #     ref_sig_ch1,
+                #     coefs[bead_idx, 1, :, :],
+                #     kernel_size = align_kernel_size,
+                #     align_window_size = align_window_size,
+                #     return_size = return_window_size,
+                #     plot = False,
+                # )
+                # aligned_coefs[c_idx, 1, :, :] = sig_aligned[:,:6].copy()
+            except ValueError:  #Alignment failed, skip this bead
+                if plot_errors:
+                    print('Alignment failed for %d' % c_idx)
+                    visualize.show_sig(*coefs[bead_idx, 0, :, :].T)
+                    visualize.show_sig(*ref_sig_ch0.T)
+                keep[c_idx] = False 
+
+            c_idx += 1
+
+    aligned_coefs = aligned_coefs[keep, :, :, :]
+
+    return aligned_coefs
+
+def fit_polynomial_model(coefs, plot=True):
+    """
+    Fit a fourth-order polynomial to Zernike coefficients
+    as a function of z.
+
+    args
+    ----
+        coefs :  3D ndarray of shape (n_samples, Z, n_coefs)
+
+    """
+    n_samples, n_planes, n_coefs = coefs.shape 
+
+    # Make linear z-index
+    z_levels = np.asarray(list(np.arange(n_planes)) * n_samples)
+
+    # Define the merit function 
+    n_poly_coefs = 6
+    def polynomial_model(z, c0, c1, c2, c3, c4, c5):
+        """
+        args
+        ----
+            z :  1D ndarray
+            poly_coefs :  1D ndarray, polynomial
+                coefficients
+
+        returns
+        -------
+            1D ndarray, the result for each z
+
+        """
+        c = np.asarray([c0, c1, c2, c3, c4, c5])
+        Z = np.power(np.asarray([z]).T, np.arange(n_poly_coefs)).T 
+        return c.dot(Z)
+
+    # Coefficient matrix, for result
+    C = np.zeros((n_coefs, n_poly_coefs), dtype = 'float64')
+
+    # Fit each coefficient to a linear model 
+    for coef_idx in range(n_coefs):
+        response = coefs[:,:,coef_idx].flatten()
+        poly_coefs, pcov = curve_fit(
+            polynomial_model,
+            z_levels,
+            response,
+        )
+        C[coef_idx, :] = poly_coefs 
+
+    # Show the result
+    if plot:
+        # Make 1D plot
+        fig, ax = plt.subplots(1, n_coefs, figsize = (3 * n_coefs, 3))
+        for coef_idx in range(n_coefs):
+            fit = polynomial_model(z_levels[:n_planes], *C[coef_idx, :])
+            ax[coef_idx].plot(
+                z_levels,
+                coefs[:,:,coef_idx].flatten(),
+                marker = '.',
+                markersize = 5,
+                linestyle = '',
+                color = 'r',
+                label = 'Data',
+            )
+            ax[coef_idx].plot(
+                z_levels[:n_planes],
+                fit,
+                linestyle = '--',
+                color = 'k',
+                label = 'Polynomial model',
+            )
+            ax[coef_idx].set_ylim((0, 1))
+            ax[coef_idx].set_title('Coefficient %d' % coef_idx)
+            ax[coef_idx].legend(frameon = False, loc = 'upper right')
+        plt.show(); plt.close()
+
+        # Make 2D plot
+        if n_coefs == 2:
+            visualize.plot_2d_poly_fit(coefs, C, ylim=(0,1), xlim=(0,1))
+
+    return C 
+
 def detect_beads_biplane(nd2_file, threshold = 5000, max_distance = 8.0):
     '''
     Use a simple DoG filter to find beads in both 
@@ -189,6 +410,8 @@ def zernike_coefs_beads(
     subtract_bg = True,
     plot_coefs = False,
     smooth_kernel = None,
+    channel_gains = [1.0, 1.0],
+    channel_bgs = [0.0, 0.0],
 ):
     # Find beads in each channel 
     detections_0, detections_1, max_int_0, max_int_1 = detect_beads_biplane(
@@ -228,6 +451,12 @@ def zernike_coefs_beads(
     n_beads = detections_0.shape[0]
     n_planes = bead_images_ch0.shape[1]
 
+    # Convert from grayvalues to photons
+    bead_images_ch0 = (bead_images_ch0 - channel_bgs[0]) / channel_gains[0]
+    bead_images_ch1 = (bead_images_ch1 - channel_bgs[1]) / channel_gains[1]
+    bead_images_ch0[bead_images_ch0 < 0] = 0
+    bead_images_ch1[bead_images_ch1 < 0] = 0
+
     # If desired, smooth the bead images
     if not (smooth_kernel is None):
         for bead_idx in range(n_beads):
@@ -241,8 +470,10 @@ def zernike_coefs_beads(
                     smooth_kernel
                 )
 
-    # Calculate the Zernike coefficients
-    coefs = np.empty((n_beads, 2, n_planes, 6), dtype = 'float64')
+    # Calculate the Zernike coefficients. First 15 columns are the
+    # first 15 Zernike coefficients, while the last is the mean 
+    # radial distance from the point of maximal radial symmetry
+    coefs = np.empty((n_beads, 2, n_planes, 16), dtype = 'float64')
     for bead_idx in range(n_beads):
         for plane_idx in range(n_planes):
             image_ch0 = bead_images_ch0[bead_idx, plane_idx, :, :]
@@ -258,7 +489,7 @@ def zernike_coefs_beads(
                 center_ch0 = centers_re_ch0[bead_idx, plane_idx, :]
                 center_ch1 = centers_re_ch1[bead_idx, plane_idx, :]
 
-            coefs[bead_idx, 0, plane_idx, :] = z_trans.fwd_6(
+            coefs[bead_idx, 0, plane_idx, :-1] = z_trans.fwd_15(
                 image_ch0,
                 center_ch0,
                 scale=scale, 
@@ -266,7 +497,7 @@ def zernike_coefs_beads(
                 center_int=center_int,
                 subtract_bg = subtract_bg,
             )
-            coefs[bead_idx, 1, plane_idx, :] = z_trans.fwd_6(
+            coefs[bead_idx, 1, plane_idx, :-1] = z_trans.fwd_15(
                 image_ch1,
                 center_ch1,
                 scale=scale, 
@@ -274,22 +505,34 @@ def zernike_coefs_beads(
                 center_int=center_int,
                 subtract_bg = subtract_bg,
             )
+            coefs[bead_idx, 0, plane_idx, -1] = z_trans.mean_r(
+                image_ch0,
+                center_ch0,
+                scale=scale,
+                unit_disk_only=unit_disk_only,
+            )
+            coefs[bead_idx, 1, plane_idx, -1] = z_trans.mean_r(
+                image_ch1,
+                center_ch1,
+                scale=scale,
+                unit_disk_only=unit_disk_only,
+            )
 
     if plot_coefs:
         coefs_rescaled = coefs.copy()
         for bead_idx in range(n_beads):
-            for z in range(6):
+            for z in range(16):
                 coefs_rescaled[bead_idx, 0, :, z] = coefs_rescaled[bead_idx, 0, :, z] / \
                     np.abs(coefs_rescaled[bead_idx, 0, :, z]).max()
                 coefs_rescaled[bead_idx, 1, :, z] = coefs_rescaled[bead_idx, 1, :, z] / \
                     np.abs(coefs_rescaled[bead_idx, 1, :, z]).max()
 
-        fig, ax = plt.subplots(2, n_beads, figsize = (3*n_beads, 6))
+        fig, ax = plt.subplots(2, n_beads, figsize = (3*n_beads, 7))
         if len(ax.shape) == 1:
             ax = np.asarray([ax]).T
         z_levels = np.arange(n_planes)
         for bead_idx in range(n_beads):
-            for coef_idx in range(6):
+            for coef_idx in range(16):
                 ax[0, bead_idx].plot(z_levels, coefs[bead_idx, 0, :, coef_idx], label = coef_idx)
                 ax[1, bead_idx].plot(z_levels, coefs[bead_idx, 1, :, coef_idx], label = coef_idx)
             ax[0, bead_idx].legend(frameon = False)
@@ -299,144 +542,6 @@ def zernike_coefs_beads(
         plt.show(); plt.close()
 
     return bead_images_ch0, bead_images_ch1, centers_re_ch0, centers_re_ch1, coefs 
-
-def find_and_align(
-    *nd2_files,
-    threshold = 5000,
-    max_distance = 8.0,
-    window_size = 15,
-    scale = 5.0,
-    unit_disk_only = True,
-    center_int = False,
-    subtract_bg = True,
-    plot_coefs = False,
-    align_kernel_size = 5,
-    align_window_size = 61,
-    return_window_size = 61,
-    plot_errors = False,
-):
-    """
-    Given a set of ND2 files, find all beads, 
-    calculate Zernike coefficients, and align
-    the signals.
-
-    Robust combinations:
-        scale = 5.0, center_int = False
-        scale = 4.0, center_int = False
-        scale = 5.0, center_int = True
-        scale = 4.0, center_int = True 
-
-    args
-    ----
-        *nd2_files :   str
-        threshold :  float, detection stringency
-        max_distance :  float, maximum tolerated distance
-            between beads in channels 0 and 1
-        window_size :  int, the fitting window size
-        scale :  float, radius of the unit disk on which
-            to compute Zernike coefficients in um
-        unit_disk_only :  bool, only compute Zernike 
-            coefficients on the rescaled unit disk (recommended)
-        center_int :  bool, center the intensities before
-            computing coefficients 1 onward
-        plot_coefs :  bool
-        align_kernel_size :  int, size of kernel to be used for
-            smoothing signals before alignment
-        align_window_size :  int, size of the window used for
-            computing cross-correlation during alignment
-        return_window_size :  int, size of the return window
-            around the aligned signals
-        plot_errors :  bool
-
-    returns
-    -------
-        4D ndarray of shape (n_beads, 2, return_window_size, 6),
-            the first six Zernike coefficients for each bead,
-            channel, and z-plane
-
-    """
-    all_coefs = []
-
-    # Find beads and calculate Zernike coefficients
-    print("Finding beads and calculating Zernike coefficients...")
-    for nd2_idx, nd2_file in tqdm(enumerate(nd2_files)):
-        stack_ch0, stack_ch1, centers_ch0, centers_ch1, coefs = \
-            zernike_coefs_beads(
-                nd2_file,
-                threshold = threshold,
-                max_distance = max_distance,
-                window_size = window_size,
-                scale = scale,
-                unit_disk_only = unit_disk_only,
-                center_int = center_int,
-                subtract_bg = subtract_bg,
-                plot_coefs = plot_coefs,
-                smooth_kernel = None,
-            )
-        all_coefs.append(coefs)
-
-    # Align all of the signals
-    print("Aligning signals...")
-    n_signals = sum([all_coefs[i].shape[0] for i in range(len(all_coefs))])
-    keep = np.ones(n_signals, dtype = 'bool')
-
-    aligned_coefs = np.zeros((n_signals, 2, return_window_size, 6), dtype = 'float64')
-    c_idx = 0
-
-    ref_sig_ch0 = all_coefs[0][0,0,:,:]
-    ref_sig_ch1 = all_coefs[0][0,1,:,:]
-    hw = int(return_window_size) // 2
-
-    for nd2_idx in range(len(nd2_files)):
-        coefs = all_coefs[nd2_idx]
-        n_beads = coefs.shape[0]
-        for bead_idx in range(n_beads):
-
-            # Try to do alignment. If it fails, skip
-            # that bead.
-            try:
-                # Align channel 0
-                _ref_aligned, sig_aligned, n0, n1 = align_coefs(
-                    ref_sig_ch0,
-                    coefs[bead_idx, 0, :, :],
-                    kernel_size = align_kernel_size,
-                    align_window_size = align_window_size,
-                    return_size = return_window_size,
-                    plot = False,
-                )
-                aligned_coefs[c_idx, 0, :, :] = sig_aligned[:,:6].copy()
-
-                # Get the corresponding signal in channel 1
-                aligned_coefs[c_idx, 1, :, :] = coefs[
-                    bead_idx,
-                    1,
-                    n1-hw : n1+hw+1,
-                    :6,
-                ].copy()
-
-                # Align channel 1
-                # _ref_aligned, sig_aligned, n0, n1 = align_coefs(
-                #     ref_sig_ch1,
-                #     coefs[bead_idx, 1, :, :],
-                #     kernel_size = align_kernel_size,
-                #     align_window_size = align_window_size,
-                #     return_size = return_window_size,
-                #     plot = False,
-                # )
-                # aligned_coefs[c_idx, 1, :, :] = sig_aligned[:,:6].copy()
-            except ValueError:  #Alignment failed, skip this bead
-                if plot_errors:
-                    print('Alignment failed for %d' % c_idx)
-                    visualize.show_sig(*coefs[bead_idx, 0, :, :].T)
-                    visualize.show_sig(*ref_sig_ch0.T)
-                keep[c_idx] = False 
-
-            c_idx += 1
-
-    aligned_coefs = aligned_coefs[keep, :, :, :]
-
-    return aligned_coefs
-
 
 def align_coefs(coefs_0, coefs_1, plot=True, kernel_size=6,
     align_window_size=61, return_size=101):
@@ -615,85 +720,6 @@ def mean_radial_distance_zstack(zstack, scale=5.0, unit_disk_only=True,
             result[z_idx] = (R * _I).sum()
 
     return result 
-
-def fit_polynomial_model(coefs, plot=True):
-    """
-    Fit a fourth-order polynomial to Zernike coefficients
-    as a function of z.
-
-    args
-    ----
-        coefs :  3D ndarray of shape (n_samples, Z, n_coefs)
-
-    """
-    n_samples, n_planes, n_coefs = coefs.shape 
-
-    # Make linear z-index
-    z_levels = np.asarray(list(np.arange(n_planes)) * n_samples)
-
-    # Define the merit function 
-    n_poly_coefs = 6
-    def polynomial_model(z, c0, c1, c2, c3, c4, c5):
-        """
-        args
-        ----
-            z :  1D ndarray
-            poly_coefs :  1D ndarray, polynomial
-                coefficients
-
-        returns
-        -------
-            1D ndarray, the result for each z
-
-        """
-        c = np.asarray([c0, c1, c2, c3, c4, c5])
-        Z = np.power(np.asarray([z]).T, np.arange(n_poly_coefs)).T 
-        return c.dot(Z)
-
-    # Coefficient matrix, for result
-    C = np.zeros((n_coefs, n_poly_coefs), dtype = 'float64')
-
-    # Fit each coefficient to a linear model 
-    for coef_idx in range(n_coefs):
-        response = coefs[:,:,coef_idx].flatten()
-        poly_coefs, pcov = curve_fit(
-            polynomial_model,
-            z_levels,
-            response,
-        )
-        C[coef_idx, :] = poly_coefs 
-
-    # Show the result
-    if plot:
-        # Make 1D plot
-        fig, ax = plt.subplots(1, n_coefs, figsize = (3 * n_coefs, 3))
-        for coef_idx in range(n_coefs):
-            fit = polynomial_model(z_levels[:n_planes], *C[coef_idx, :])
-            ax[coef_idx].plot(
-                z_levels,
-                coefs[:,:,coef_idx].flatten(),
-                marker = '.',
-                markersize = 5,
-                linestyle = '',
-                color = 'r',
-                label = 'Data',
-            )
-            ax[coef_idx].plot(
-                z_levels[:n_planes],
-                fit,
-                linestyle = '--',
-                color = 'k',
-                label = 'Polynomial model',
-            )
-            ax[coef_idx].set_title('Coefficient %d' % coef_idx)
-            ax[coef_idx].legend(frameon = False, loc = 'upper right')
-        plt.show(); plt.close()
-
-        # Make 2D plot
-        if n_coefs == 2:
-            visualize.plot_2d_poly_fit(coefs, C)
-
-    return C 
 
 
 
