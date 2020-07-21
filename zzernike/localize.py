@@ -769,6 +769,91 @@ def match_locs(locs_0, locs_1, tol_radius=8.0, outlier_tol=8.0):
 
     return locs_0_matched 
 
+def match_locs_by_affine_field(
+    nd2_file,
+    locs_0,
+    afm, 
+    offset,
+    scale = 3.0,
+    unit_disk_only = True,
+    center_int = False,
+    subtract_bg = False,
+    window_size = 13,
+    ch1_gain = 96.4723,
+    ch1_bg = 212.1311,
+):
+    reader = ND2Reader(nd2_file)
+
+    afmi = afm + np.identity(2)
+    yx0 = np.asarray(locs_0[['y_pixels', 'x_pixels', 'frame_idx']])
+    yx1 = afmi.dot(yx0[:,:2].T).T + offset
+    yx1_int = yx1.astype('int64')
+
+    hw = int(window_size) // 2
+    n_locs = len(locs_0)
+    unique_frames = np.unique(locs_0['frame_idx'])
+
+    locs_1 = np.zeros((n_locs, 23), dtype = 'float64')
+
+    c_idx = 0
+    for frame_idx in tqdm(unique_frames):
+        frame = reader.get_frame_2D(t=frame_idx, c=1).astype('float64')
+        locs_in_frame = yx1_int[(yx0[:,2]==frame_idx), :]
+
+        for l_idx in range(locs_in_frame.shape[0]):
+            y0, x0 = locs_in_frame[l_idx, :]
+            psf_image_ch1 = frame[
+                y0-hw : y0+hw+1,
+                x0-hw : x0+hw+1,
+            ]
+
+            # Convert to photons
+            psf_image_ch1 = (psf_image_ch1 - ch1_bg) / ch1_gain 
+            psf_image_ch1[psf_image_ch1 < 0] = 0
+
+            # Save the results
+            locs_1[c_idx, 0] = frame_idx
+            locs_1[c_idx, 1:3] = locs_in_frame[l_idx, :]
+            locs_1[c_idx, 3] = np.nan 
+            locs_1[c_idx, 4:6] = radial_symmetry(psf_image_ch1)
+            locs_1[c_idx, 7:22] = z_trans.fwd_15(
+                psf_image_ch1,
+                locs_1[c_idx, 4:6],
+                scale = scale,
+                unit_disk_only = unit_disk_only,
+                center_int = center_int,
+                subtract_bg = subtract_bg,
+            ).copy()
+            locs_1[c_idx, 22] = z_trans.mean_r(
+                psf_image_ch1,
+                locs_1[c_idx, 4:6],
+                scale = scale,
+                unit_disk_only = unit_disk_only,
+            )
+            c_idx += 1 
+
+    reader.close()
+
+    # Reformat as pandas.DataFrame
+    locs_1 = pd.DataFrame(locs_1, columns = [
+        'frame_idx', 'y_detect', 'x_detect', 'llr', 'y_pixels', 'x_pixels',
+        'error_code', 'Z0', 'Z1', 'Z2', 'Z3', 'Z4', 'Z5', 'Z6', 'Z7',
+        'Z8', 'Z9', 'Z10', 'Z11', 'Z12', 'Z13', 'Z14', 'R0',
+    ])
+    locs_1['frame_idx'] = locs_1['frame_idx'].astype('int64')
+    locs_1['y_detect'] = locs_1['y_detect'].astype('int64')
+    locs_1['x_detect'] = locs_1['x_detect'].astype('int64')
+    locs_1['error_code'] = locs_1['error_code'].astype('int64')
+
+    # Add the new columns to the original dataframe
+    for c in ['y_pixels', 'x_pixels', 'error_code', 'Z0', 'Z1', 'Z2',
+        'Z3', 'Z4', 'Z5', 'Z6', 'Z7', 'Z8', 'Z9', 'Z10', 'Z11', 'Z12',
+        'Z13', 'Z14', 'R0']:
+        locs_0['%s_ch1' % c] = locs_1[c]
+
+    return locs_0
+
+
 def f_ratio(matched_locs, col_name):
     """
     Convenience function to take the f-ratio of 
